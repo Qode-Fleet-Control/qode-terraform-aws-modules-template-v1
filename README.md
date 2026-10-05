@@ -1,130 +1,93 @@
-# fleet-template-v1
+# Terraform AWS Modules template
 
-## What This Template Is
+Provisioned from [`Qode-Fleet-Control/fleet-template-v1`](https://github.com/Qode-Fleet-Control/fleet-template-v1) — the fleet
+lifecycle contract (`bin/`, `fleet.conf`, `compose.yaml`, deploy workflows) with a
+Terraform root module built from the community
+[terraform-aws-modules](https://github.com/terraform-aws-modules) laid on top.
 
-`fleet-template-v1` is a **language-agnostic app lifecycle harness** for apps
-managed by the fleet platform. It gives any app — Node, Python, Go, a Docker
-Compose stack, anything — a uniform way to be deployed and controlled, without
-the fleet needing to know a single thing about your stack.
+**This repo is a job, not a service.** Its container runs `terraform fmt -check`, `init`
+and `validate`, then exits — 0 when all of it passes. **No AWS credentials are needed or
+used**: `validate` never calls the AWS API. Nothing listens on `$PORT`.
 
-The fleet injects runtime variables into the environment (`PORT`, `BASE_PATH`,
-`DATABASE_URL`) and calls `./bin/run` to deploy. Everything project-specific —
-how to install, build, and start your app — lives in **one file: `fleet.conf`**.
-That is the only file you edit per project.
+## What is in it
 
-## Repository Structure
+| file | |
+|---|---|
+| `versions.tf` | `required_version`, `hashicorp/aws ~> 6.29` |
+| `providers.tf` | the AWS provider: region from `var.region`, `default_tags` on everything |
+| `variables.tf` | name, environment, region, VPC CIDR, AZ count, single/per-AZ NAT |
+| `main.tf` | `terraform-aws-modules/vpc/aws ~> 6.7` — public, private and database subnets over N AZs, NAT, DNS, EKS-style subnet tags; `terraform-aws-modules/security-group/aws ~> 6.0` — a web SG (HTTPS in, all out) |
+| `outputs.tf` | VPC id, subnet ids, DB subnet group, SG id |
+| `.terraform.lock.hcl` | the AWS provider pinned with hashes for linux/darwin amd64+arm64 and windows amd64 — commit it |
+| `terraform.tfvars.example` | copy to `terraform.tfvars` (git-ignored) to override defaults |
+| `scripts/check.sh` | the job: `fmt -check -recursive`, `init -backend=false -lockfile=readonly`, `validate` |
 
-```
-fleet.conf        ← the only file you edit per project
-.env              ← local-only env vars (gitignored)
-bin/
-  _common.sh      ← shared logic; never edit this
-  run             ← install + build + start (called by the fleet)
-  start           ← start only (no rebuild)
-  restart         ← stop + full run
-  reload          ← hot-reload config without rebuild
-  stop            ← stop the running process
-```
+Subnets are carved from `vpc_cidr` with `cidrsubnet`, and AZ names are built from the
+region (`us-east-1a` …) rather than read from the `aws_availability_zones` data source,
+so the module stays checkable without an AWS account. Switch to the data source once it
+runs with credentials.
 
-## The One File You Edit: `fleet.conf`
+## Run it
 
-`fleet.conf` is sourced as shell by the lifecycle scripts. Fill in the commands
-for your stack; leave any command empty (`''`) to skip that step.
+**On the fleet:** `bin/run` builds the image (`docker compose build`) and stops there —
+`DOCKER_START_CMD` is empty because there is no server. Run the job with
+`docker compose run --rm app`.
 
-```sh
-NAME="my-app"           # label shown in fleet logs
-PORT="3000"             # default port (fleet overrides via $PORT env var)
-HEALTH_PATH="/"         # HTTP path that returns 200 when the app is ready
+**With docker:**
 
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/server.js'   # must listen on $PORT; run in foreground
-RELOAD_CMD=''           # optional; empty → falls back to stop+start
-```
+    docker compose build
+    docker compose run --rm app        # exit 0 = fmt, init and validate all passed
 
-> **Critical rule:** single-quote any command that uses `$PORT` or
-> `$BASE_PATH`. Single quotes defer variable expansion to **runtime** — when the
-> command actually runs, with the fleet-injected value — rather than at the
-> moment `fleet.conf` is sourced (when those values aren't set yet). Use
-> `START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'`, never double quotes.
+**Without docker** (needs `terraform` >= 1.10 on `PATH`):
 
-## How the Lifecycle Works
+    sh scripts/check.sh
+    # with AWS credentials in the environment, for real:
+    terraform init && terraform plan && terraform apply
 
-| Script | What it does | When to use |
-| --- | --- | --- |
-| `bin/run` | `INSTALL_CMD` → `BUILD_CMD` → `START_CMD` | Fleet deploy, fresh start |
-| `bin/start` | `START_CMD` only | Restart without rebuild |
-| `bin/restart` | stop + `bin/run` | After a code/dep change |
-| `bin/reload` | `RELOAD_CMD`, or stop+start if empty | After a config-only change |
-| `bin/stop` | Kill by pidfile or port | Tear down |
+`FLEET_RUNTIME=process bin/run` runs `INSTALL_CMD` (`terraform init`) and `BUILD_CMD`
+(`terraform validate`) and then stops at the start step, by design.
 
-> The process PID is written to `.fleet/app.pid` so subsequent `stop`/`restart`
-> calls can find and terminate it reliably. If the pidfile is missing or stale,
-> `stop` falls back to freeing whatever is listening on `$PORT`.
+## Origin
 
-## How to Apply This to Your Project
+    hand-written — Terraform ships no project generator
 
-### Step 1 — Copy the template into your repo
+A root module in HashiCorp's standard module structure consuming registry modules, the
+way the terraform-aws-modules READMEs show (`source = "terraform-aws-modules/vpc/aws"`,
+`version = "~> 6.7"`). The lock file came from the official image:
 
-```sh
-cp -r fleet-template-v1/* my-project/
-```
+    docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/w -w /w hashicorp/terraform:1.16.5 init -backend=false
+    docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/w -w /w hashicorp/terraform:1.16.5 \
+      providers lock -platform=linux_amd64 -platform=linux_arm64 -platform=darwin_amd64 -platform=darwin_arm64 -platform=windows_amd64
 
-Or, if starting fresh, just clone it and work from `main`.
+## Deviations, and why
 
-### Step 2 — Edit `fleet.conf` (the only required change)
+- `Dockerfile` is a job image on `hashicorp/terraform:1.16.5`: its `ENTRYPOINT` (`terraform`)
+  is cleared and the default command is `scripts/check.sh`. Runs as non-root `app` (uid 10001).
+- Unlike the other Terraform templates, `init` runs when the job runs, not at image build:
+  the AWS provider is several hundred MB unpacked, and baking it into the image would
+  multiply its size for a step that only checks the code. The download is pinned and
+  verified by the committed lock file, so the job needs registry access when it runs.
+- `init -backend=false`: validation needs no state. Add a backend (S3 + DynamoDB/lockfile)
+  before planning against a real account.
+- The fleet passes `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` through
+  `compose.yaml` (they point at the workspace's MinIO). `init`/`validate` never use them;
+  do not run `plan`/`apply` with them.
 
-Fill in your stack's commands. Per-stack examples:
+## Verified
 
-```sh
-# Node.js
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/index.js'
+**The docker job has NOT been verified yet.** On 2026-10-05 the build host's docker disk
+stayed below the 6 GB floor (0-3 GB free) for over three hours, so `docker compose build`
+was never run for this repo. Build and run it once before trusting it:
 
-# Python (Gunicorn)
-INSTALL_CMD='pip install -r requirements.txt'
-BUILD_CMD=''
-START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'
+    docker compose build && docker compose run --rm app; docker compose down --rmi local -v
 
-# Go
-INSTALL_CMD=''
-BUILD_CMD='go build -o ./out/server ./cmd/server'
-START_CMD='./out/server'
+What WAS checked, with the real CLIs outside docker (same `scripts/check.sh` the image runs):
 
-# Docker Compose
-INSTALL_CMD=''
-BUILD_CMD='docker compose build'
-START_CMD='docker compose up'
-RELOAD_CMD='docker compose up -d --no-build'
-```
+    terraform 1.16.5: sh scripts/check.sh   # fmt ok, init ok (vpc 6.7.3, security-group 6.0.0, aws 6.67.0),
+                                            # validate "Success!" -> exit 0, no AWS credentials set
 
-### Step 3 — Set local env vars in `.env` (gitignored)
+## Serving over HTTP
 
-```sh
-APP_NAME=My App
-DATABASE_URL=postgres://localhost/mydb
-```
-
-### Step 4 — Verify standalone
-
-```sh
-PORT=3001 bin/run      # should install, build, and serve on 3001
-curl http://localhost:3001/   # should 200
-```
-
-### Step 5 — Connect to the fleet
-
-Point the fleet at your repo. It will clone it, inject `PORT` / `BASE_PATH` /
-`DATABASE_URL`, and call `bin/run`. As long as your `START_CMD` listens on
-`$PORT` and `HEALTH_PATH` returns 200, the fleet will mark the app healthy.
-
-## Key Invariants
-
-- **`START_CMD` must run in the foreground and listen on `$PORT`.** Do not use a
-  dev server — HMR / hot-reload chunks 404 behind the ingress and will break the
-  app.
-- **Never put secrets in `fleet.conf`** — it's committed. Use `.env` locally;
-  the fleet injects secrets via the environment.
-- **`bin/_common.sh` is shared infrastructure** — don't edit it per project. All
-  project-specific configuration belongs in `fleet.conf`.
+There is no HTTP surface. If you add one, listen on `0.0.0.0:$PORT`, serve at `/`, set
+`PORT`, `HEALTH_PATH`, `START_CMD` and `DOCKER_START_CMD` in `fleet.conf`, and publish
+`"${PORT}:${PORT}"` in `compose.yaml`. See `docs/fleet-lifecycle.md`.
