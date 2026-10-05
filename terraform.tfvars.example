@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars (git-ignored) to override the defaults.
+name               = "fleet"
+environment        = "dev"
+region             = "us-east-1"
+vpc_cidr           = "10.0.0.0/16"
+az_count           = 3
+single_nat_gateway = true
